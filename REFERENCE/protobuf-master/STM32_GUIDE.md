@@ -1,8 +1,6 @@
 # STM32 车载发送端开发指南
 
-
-
-我们的遥测系统使用 **Google Protobuf** 协议对数据进行序列化，但在单片机（STM32）上，我们使用 **Nanopb** 这个轻量级库。
+车端使用 **Nanopb** 对 `TelemetryFrame` 进行编码。
 
 ## 1. 文件位置
 
@@ -15,13 +13,11 @@
 
 ## 2. 如何生成 STM32 代码 (如果需要更新)
 
+准备环境： [Nanopb](https://jpa.kapsi.fi/nanopb/)，将生成器目录加入 PATH，或者直接调用 `nanopb_generator.py`。
+
 如果你修改了 `.proto` 文件，你需要使用 Nanopb 提供的生成器脚本重新生成 C 代码。
 
-### 准备环境
-确保你下载了 [Nanopb](https://jpa.kapsi.fi/nanopb/)，将生成器目录加入 PATH，或者直接调用 `nanopb_generator.py`。
-
 ### 生成命令
-在 `protos` 目录下运行命令行：
 
 ```bash
 # 假设你已经安装了 nanopb_generator
@@ -34,16 +30,11 @@ nanopb_generator fsae_telemetry.proto
 python path/to/nanopb/generator/nanopb_generator.py fsae_telemetry.proto
 ```
 
-当前机器目录（macOS）：
+当前机器目录（macOS）示例：
 
 ```bash
 python /Users/poli/nanopb-0.4.9.1-macosx-x86/generator/nanopb_generator.py fsae_telemetry.proto
 ```
-
-
-
-
-
 ### 产物
 
 执行成功后，你会得到：
@@ -69,45 +60,35 @@ python /Users/poli/nanopb-0.4.9.1-macosx-x86/generator/nanopb_generator.py fsae_
 *   `pb.h`
 *   `fsae_telemetry.pb.c/.h`
 
-## 4. 编程注意事项 (Critical)
+## 4. 约束
 
-1. **数组长度**:
-   在 `.proto` 中定义的 `repeated` 字段（如 `modules`），在 C 语言中会被生成为结构体数组。
-   Nanopb 会使用 `.options` 文件中的 `max_count` 来静态分配内存。
-   *   例如：`fsae.TelemetryFrame.modules max_count:6`
-   *   代码中必须设置 `frame.modules_count` 来告诉编码器实际有多少个有效数据。
-   ```c
-   TelemetryFrame frame = TelemetryFrame_init_zero;
-   frame.modules_count = 6; // 必须设置！不能超过 6
-   ```
-   当前协议为**单 Topic**设计，建议将基础遥测和 `modules` 一起编码进同一个 `TelemetryFrame` 后发送到 `fsae/telemetry`。
+- `repeated` 字段必须在 `.options` 里配置 `max_count`
+- `frame.modules_count` 必须显式设置，且不能超过上限
+- 不要手改生成的 `.pb.c/.h`
+- 当前链路为单 Topic：`fsae/telemetry`
+- 非必要不要新增字符串和布尔字段
 
-2. **字符串**:
-   如果有 string 类型，Nanopb 也会生成 `char array[SIZE]`。同样需要在 `.options` 中指定 `max_size`。目前我们的定义里应该没有 string，主要是数值。
+## 5. 当前 CAN2RS485 工程
 
-> ​	注： 推荐不要新加数据 或者字符串型或者是布尔类型的，可能会导致服务器端报错，普通的数值型即可。
+现状如下：
 
-1.  **不要手动修改生成的 .c/.h**:
-    每次 `.proto` 更新，都应该重新生成，而不是手动去改 C 代码，否则下次更新会被覆盖。
+- 输出：`USART2` 半双工 RS485 到 DTU
+- 发送对象：统一 `TelemetryFrame`
+- 发送策略：基础帧 10Hz，带 `modules` 的帧 2Hz
+- 已实现输入：
+  - 旧主控 `CAN1` 电压、温度、总览、极值、状态、告警
+  - 霍尔电流 `0x03C0`
+  - `CAN2` 的 `0x18FF50E5`、`0x401`、`0x402`
+- 默认优先兼容旧主控；检测到新主控专用帧后切换协议分支
+- 485 时序保持 `DIR 高 -> UART 发送 -> 等待 TC -> DIR 低`
 
-## 5. 当前 CAN2RS485 工程做法
+### 5.1 当前限制
 
-*   输入：旧主控 `CAN1`
-*   输出：`USART2` 半双工 RS485 到 DTU
-*   数据源：
-    *   从控电压帧 `0x180050F3 + (n<<16)`
-    *   从控温度帧 `0x184050F3 + (i<<16)`
-    *   旧主控摘要帧 `0x186050F4 / 0x186150F4 / 0x186250F4 / 0x186350F4 / 0x187650F4`
-    *   霍尔电流帧 `0x03C0`
-*   发送策略：
-    *   基础 `TelemetryFrame` 10Hz
-    *   带 `modules` 的完整帧 2Hz
-*   485 方向控制：
-    *   发送前拉高 `RS485_DIR`
-    *   `HAL_UART_Transmit()` 返回后继续等待 `UART_FLAG_TC`
-    *   最后一个停止位完成后再拉低 `RS485_DIR`
+- `CAN2` 只做被动监听
+- `0x18A*`、`0x188350F5` 还没有完整闭环和应答帧
+- `.proto` 还没有覆盖新主控全部诊断细节
 
-## 6. 示例代码片段
+## 6. 示例
 
 ```c
 #include "pb_encode.h"
@@ -140,20 +121,8 @@ void send_telemetry() {
 }
 
 ```
-
-
-
-
-
 如果未来发现流量过大，可以将 `.proto` 中的 `float` 改为 `int32`，单位使用**毫伏(mV)** 和 **0.1摄氏度**。这样配合 Protobuf 的 Varint 编码（小整数占用字节少），可以压缩一半左右的体积。但目前的 `float` 方案实现最简单，建议先用着。
 
 ### 下一步建议
 
-为了确保你的 STM32 不会因为栈溢出（Stack Overflow）而崩溃，建议你检查 `send_telemetry` 函数中 `uint8_t buffer[1024]` 的定义位置。如果这是在一个任务栈很小的 FreeRTOS 任务中定义的局部变量，**请将其改为全局变量 (`static uint8_t buffer[1024]`)** 或者增大该任务的栈空间。
-
-另外，考虑 DTU 带宽限制，当前 `TelemetryFrame` 的 BMS 摘要字段只保留：
-
-*   `battery_soc`
-*   `max_cell_voltage` / `min_cell_voltage` 及其编号
-*   `max_temp` / `min_temp` 及其编号
-*   `battery_fault_code`
+为了避免栈溢出，车端编码缓冲和 `TelemetryFrame` 最好使用静态存储，而不是在较小栈上定义大对象。当前 `CAN2RS485` 工程已经按这个原则实现，后续新增大数组或大结构时也应保持一致。

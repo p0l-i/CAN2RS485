@@ -23,7 +23,7 @@
     *   可以直接在 Message 末尾添加新字段，使用新的 ID。
     *   例如：`float tire_pressure = 40;`
     *   **注意**：新增字段后，如果能在服务器数据库看到它，还需要手动修改服务器的 `telegraf.conf`，添加对应的 XML Path 映射。否则服务器只会忽略这个新数据，虽然不会报错。
-    *   当前仓库已经改为**单 Topic**方案：`TelemetryFrame` 既承载基础遥测，也承载 `modules` 中的 BMS 详细数据。新增字段时同时检查 `telemetry` 和 `bms_data` 两个 measurement 的采集逻辑。
+    *   **单 Topic**方案：`TelemetryFrame` 既承载基础遥测，也承载 `modules` 中的 BMS 详细数据。新增字段时同时检查 `telemetry` 和 `bms_data` 两个 measurement 的采集逻辑。
     *   带宽有限，优先保留上云必须的摘要量。当前 BMS 摘要字段只保留：`battery_soc`、最大/最小单体电压及编号、最大/最小温度及编号、`battery_fault_code`。
 
 4.  **数组长度控制**：
@@ -85,12 +85,3 @@ fsae.TelemetryFrame.modules    max_count:6
         tire_pressure_fl = "number(//tire_pressure_fl)"
         ```
     *   重启 Telegraf: `docker-compose restart telegraf`
-
-### 场景：我想只保留一个 MQTT Topic
-
-当前仓库已经采用该方案：
-
-1. 发布端统一发送 `fsae/telemetry`
-2. `TelemetryFrame` 里的普通字段进入 `telemetry` measurement
-3. `TelemetryFrame.modules` 由 Telegraf 的 `metric_selection = "//modules"` 生成 `bms_data` measurement
-4. 如果客户端某一帧不携带 `modules`，则该帧只会生成 `telemetry` 数据点
