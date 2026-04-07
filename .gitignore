@@ -1,0 +1,45 @@
+# STM32CubeIDE
+.metadata/
+*.mxproject
+
+# Build directories
+Debug/
+Release/
+build/
+
+# Object files
+*.o
+*.obj
+*.d
+
+# Executables and binaries
+*.elf
+*.hex
+*.bin
+*.axf
+*.map
+
+# Static libraries
+*.a
+*.lib
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# IDE specific files
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS generated files
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*.bak
+
+# Logs
+*.log
