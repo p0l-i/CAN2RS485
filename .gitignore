@@ -45,4 +45,4 @@ Thumbs.db
 *.log
 
 # Project specific
-REFERENCE/
+REFERENCE/STM32CubeF4-master/
