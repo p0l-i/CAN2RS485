@@ -35,6 +35,7 @@ STM32(CAN) --RS485--> DTU --MQTT/4G--> 阿里云
 
 - MQTT Topic 固定为 `fsae/telemetry`
 - 基础遥测和 `modules` 共用同一条 `TelemetryFrame`
+- 当前 server 侧参考协议已切到“`TelemetryFrame` 顶层挂 `header/fast_telemetry/vehicle_state/thermal_summary/alarms`，BMS 保持老结构”的单 Topic 形态
 - 修改 `.proto` 字段名、类型或字段 ID 时，必须同步检查：
   - `stm32_code/`
   - `server_config/telegraf/telegraf.conf`

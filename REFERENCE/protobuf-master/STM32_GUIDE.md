@@ -2,6 +2,8 @@
 
 车端使用 **Nanopb** 对 `TelemetryFrame` 进行编码。
 
+注意：`server_config/protos/fsae_telemetry.proto` 目前已经演进为“单 Topic 顶层挂嵌套消息、BMS 保持旧结构”的 server 侧参考版本；如果要让车端真正切过去，仍需重新生成 STM32 侧 `.pb.c/.h` 并修改发送逻辑。当前 `CAN2RS485` 工程本身还没有切换。
+
 ## 1. 文件位置
 
 已将需要的所有文件整理在 `stm32_code` 目录下。

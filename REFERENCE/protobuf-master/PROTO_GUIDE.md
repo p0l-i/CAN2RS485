@@ -5,26 +5,28 @@
 
 ## 1. 核心文件
 
-*   `fsae_telemetry.proto`: 定义数据结构（Message）。
+*   `fsae_telemetry.proto`: 定义单 Topic 使用的顶层 `TelemetryFrame` 及其嵌套消息。
 *   `fsae_telemetry.options`: 定义 Nanopb（STM32使用）的特定选项，如数组最大长度。
 
 ## 2. 修改规范 (CRITICAL)
 
 服务器端的 Telegraf 配置文件 (`telegraf.conf`) 使用了 XPath 来提取 Protobuf 数据。这意味着：
 
-1.  **禁止修改现有字段的名称和类型**：
+1.  **禁止修改仍在服务器 XPath 中使用的字段名称和类型**：
     *   例如：`uint32 module_id = 1;` 中的 `module_id` 被写入在 `telegraf.conf` 中。如果你把它改名为 `id`，服务器将无法解析该字段，数据会丢失。
     *   如果必须修改，你**必须**同步修改服务器上 `telegraf.conf` 中的 `xpath` 映射，并重启 Telegraf 容器。
 
-2.  **禁止修改现有字段的 ID**：
+2.  **禁止复用已经删除的字段 ID**：
     *   Protobuf 依赖 ID (`= 1`, `= 2`) 来序列化。修改 ID 会导致新旧版本不兼容。
+    *   当前 `TelemetryFrame` 中原始 `1~14` 号位已删除并改为 `reserved`，这些编号不能再拿来放新字段。
 
 3.  **新增字段**：
-    *   可以直接在 Message 末尾添加新字段，使用新的 ID。
-    *   例如：`float tire_pressure = 40;`
+    *   保持单 Topic 时，优先继续在 `TelemetryFrame` 末尾追加新的嵌套消息字段，使用新的 ID。
+    *   例如：`VehicleState vehicle_state = 28;`
     *   **注意**：新增字段后，如果能在服务器数据库看到它，还需要手动修改服务器的 `telegraf.conf`，添加对应的 XML Path 映射。否则服务器只会忽略这个新数据，虽然不会报错。
     *   **单 Topic**方案：`TelemetryFrame` 既承载基础遥测，也承载 `modules` 中的 BMS 详细数据。新增字段时同时检查 `telemetry` 和 `bms_data` 两个 measurement 的采集逻辑。
     *   带宽有限，优先保留上云必须的摘要量。当前 BMS 摘要字段只保留：`battery_soc`、最大/最小单体电压及编号、最大/最小温度及编号、`battery_fault_code`。
+    *   当前约定：BMS 相关字段继续沿用老结构，`modules = 15` 和 `16~25` 的摘要字段不要随意改成新的 repeated 形状。
 
 4.  **数组长度控制**：
     *   如果有 `repeated` 字段，必须在 `fsae_telemetry.options` 中指定 `max_count`。这是为了让 STM32 (C语言) 能够静态分配内存。
@@ -48,32 +50,42 @@ message BatteryModule {
 }
 
 message TelemetryFrame {
-    // 基础信息
-    uint32 timestamp_ms = 1;
-    uint32 frame_id = 2;
-    
-    // 驾驶员输入
-    float apps_position = 3;
-    ...
-    
+    reserved 1 to 14;
+
     // BMS 详细数据
     repeated BatteryModule modules = 15;
+
+    // BMS 摘要
+    uint32 battery_soc = 16;
+    ...
+
+    // v2 追加字段
+    PacketHeader header = 26;
+    FastTelemetry fast_telemetry = 27;
+    VehicleState vehicle_state = 28;
+    ThermalSummary thermal_summary = 29;
+    repeated Alarm alarms = 30;
 }
 ```
 
 **fsae_telemetry.options (Nanopb):**
 
 ```plaintext
-fsae.TelemetryFrame.modules    max_count:6
+fsae.Alarm.message                 max_size:64
+fsae.TelemetryFrame.modules        max_count:6
+fsae.TelemetryFrame.alarms         max_count:8
+fsae.ThermalSensorSummary.chunks   max_count:4
+fsae.ThermalSummary.sensors        max_count:4
+fsae.VehicleState.motors           max_count:4
 ```
 
 ## 4. 常见操作流程
 
-### 场景：我想加一个“胎压”数据
+### 场景：我想加一个“整车状态”嵌套数据
 
-1.  **修改 Proto**: 在 `fsae_telemetry.proto` 的 `TelemetryFrame` 中添加：
+1.  **修改 Proto**: 在 `fsae_telemetry.proto` 的 `TelemetryFrame` 末尾添加新的 message 字段：
     ```protobuf
-    float tire_pressure_fl = 20; // Front Left
+    VehicleState vehicle_state = 28;
     ```
 2.  **生成代码**:
     *   **Python (本地模拟)**: 运行 `protoc --python_out=. fsae_telemetry.proto`，这会生成` fsae_telemetry_pb2.py`
@@ -82,6 +94,6 @@ fsae.TelemetryFrame.modules    max_count:6
     *   登录服务器，编辑 `server_config/telegraf/telegraf.conf`。
     *   在 `[[inputs.mqtt_consumer.xpath.fields]]` 下添加：
         ```toml
-        tire_pressure_fl = "number(//tire_pressure_fl)"
+        speed_kmh = "number(//vehicle_state/speed_kmh)"
         ```
     *   重启 Telegraf: `docker-compose restart telegraf`

@@ -1,0 +1,9 @@
+# 已知固定数量/明确上限的 repeated 字段，转为 nanopb 静态数组
+
+fsae.Alarm.message max_size:64
+fsae.BatteryModule.cell_mv max_count:23
+fsae.BatteryModule.temp_dc max_count:8
+fsae.BmsDetail.modules max_count:6
+fsae.ThermalSensorSummary.chunks max_count:4
+fsae.ThermalSummary.sensors max_count:4
+fsae.VehicleState.motors max_count:4

@@ -1,0 +1,137 @@
+syntax = "proto3";
+package fsae;
+
+enum AlarmSeverity { // 告警等级
+  ALARM_SEVERITY_UNSPECIFIED = 0; // 未知等级
+  ALARM_SEVERITY_INFO = 1; // 提示
+  ALARM_SEVERITY_WARNING = 2; // 警告
+  ALARM_SEVERITY_ERROR = 3; // 错误
+  ALARM_SEVERITY_FATAL = 4; // 严重故障
+}
+
+enum DrivingMode { // 驾驶模式
+  DRIVING_MODE_UNSPECIFIED = 0; // 未知模式
+  DRIVING_MODE_STANDBY = 1; // 待机
+  DRIVING_MODE_READY = 2; // 就绪
+  DRIVING_MODE_DRIVE = 3; // 行驶
+  DRIVING_MODE_FAULT = 4; // 故障
+}
+
+enum ImdState { // IMD 状态
+  IMD_STATE_UNSPECIFIED = 0; // 未知状态
+  IMD_STATE_NORMAL = 1; // 绝缘正常
+  IMD_STATE_WARNING = 2; // 绝缘预警
+  IMD_STATE_FAULT = 3; // 绝缘故障
+}
+
+enum WorkState { // 工作状态
+  WORK_STATE_UNSPECIFIED = 0; // 未知状态
+  WORK_STATE_OFF = 1; // 关闭
+  WORK_STATE_PRECHARGE = 2; // 预充
+  WORK_STATE_ON = 3; // 工作中
+  WORK_STATE_FAULT = 4; // 故障
+}
+
+enum VcuStatus { // VCU 状态
+  VCU_STATUS_UNSPECIFIED = 0; // 未知状态
+  VCU_STATUS_OFF = 1; // 关闭
+  VCU_STATUS_PRECHARGE = 2; // 预充中
+  VCU_STATUS_HV_ENABLED = 3; // 高压已建立
+  VCU_STATUS_FAULT = 4; // 故障
+}
+
+enum MotorPosition { // 电机/轮位位置
+  MOTOR_POSITION_UNSPECIFIED = 0; // 未知位置
+  MOTOR_POSITION_FRONT_LEFT = 1; // 左前
+  MOTOR_POSITION_FRONT_RIGHT = 2; // 右前
+  MOTOR_POSITION_REAR_LEFT = 3; // 左后
+  MOTOR_POSITION_REAR_RIGHT = 4; // 右后
+}
+
+message PacketHeader { // 通用报文头
+  uint32 timestamp_ms = 1; // 时间戳，单位 ms
+  uint32 seq = 2; // 报文序列号
+  uint32 source_id = 3; // 数据源设备 ID
+}
+
+message Alarm { // 告警信息
+  uint32 alarm_id = 1; // 告警 ID
+  AlarmSeverity severity = 2; // 告警等级
+  string message = 3; // 告警内容
+}
+
+message FastTelemetry { // 遥测快报摘要
+  sint32 hv_voltage_dv = 1; // 高压电压，单位 0.1V
+  sint32 hv_current_ma = 2; // 总电流，单位 mA
+  sint32 battery_temp_max_c = 3; // 电池最高温度，单位摄氏度
+  DrivingMode driving_mode = 4; // 当前驾驶模式
+  uint32 speed_kmh = 5; // 车速，单位 km/h
+}
+
+message BmsSummary { // BMS 汇总信息
+  uint32 total_voltage = 1; // 电池包总电压，单位 0.1V
+  sint32 total_current = 2; // 电池包总电流，单位 mA
+  uint32 soc_pct = 3; // 荷电状态百分比
+  sint32 max_temp_c = 4; // 最高温度，单位摄氏度
+  sint32 min_temp_c = 5; // 最低温度，单位摄氏度
+  uint32 max_cell_mv = 6; // 最高单体电压，单位 mV
+  uint32 min_cell_mv = 7; // 最低单体电压，单位 mV
+  ImdState imd_state = 8; // 绝缘监测状态
+  WorkState work_state = 9; // BMS 工作状态
+}
+
+message BatteryModule { // 单个电池模组详情
+  uint32 module_id = 1; // 模组编号，建议固定为 1~6
+  repeated uint32 cell_mv = 2; // 模组内 23 个单体电压，单位 mV，按物理顺序发送
+  repeated sint32 temp_dc = 3; // 模组内 8 个温度点，单位 0.1 摄氏度，按物理顺序发送
+}
+
+message BmsDetail { // BMS 详细信息
+  repeated BatteryModule modules = 1; // 6 个电池模组数据，建议固定发送 6 条
+}
+
+message ThermalSensorSummary { // 单个轮位的红外温度摘要
+  MotorPosition position = 1; // 对应电机/轮位
+  sint32 min_temp_dc = 2; // 最低温度，单位 0.01 摄氏度
+  sint32 max_temp_dc = 3; // 最高温度，单位 0.01 摄氏度
+  sint32 avg_temp_dc = 4; // 平均温度，单位 0.01 摄氏度
+  repeated ThermalRawChunk chunks = 5; // 原始温度分片列表
+}
+
+message ThermalSummary { // 热成像摘要
+  repeated ThermalSensorSummary sensors = 1; // 四个轮位的红外温度摘要
+}
+
+message ThermalRawChunk { // 热成像原始数据分片
+  MotorPosition position = 1; // 对应电机/轮位
+  uint32 frame_id = 2; // 帧编号
+  uint32 chunk_index = 3; // 当前分片索引
+  uint32 chunk_count = 4; // 总分片数量
+  sint32 pixel_temp_dc = 5; // 当前分片像素温度，单位 0.01 摄氏度
+}
+
+message MotorState { // 单个电机状态
+  MotorPosition position = 1; // 电机位置
+  sint32 rpm = 2; // 电机转速
+  sint32 torque_nm = 3; // 电机扭矩，单位 Nm
+  sint32 power_w = 4; // 电机功率，单位 W
+  sint32 motor_temp_dc = 5; // 电机温度，单位 0.1 摄氏度
+  sint32 inverter_temp_dc = 6; // 电机控制器温度，单位 0.1 摄氏度
+  sint32 motor_error = 7; // 电机错误码
+}
+
+message VehicleState { // 整车状态
+  uint32 speed_kmh = 1; // 车速，单位 km/h
+  DrivingMode driving_mode = 2; // 当前驾驶模式
+  uint32 throttle_position = 3; // 油门开度
+  uint32 brake_position = 4; // 刹车开度
+  bool ready_to_drive = 5; // 车辆是否处于 Ready To Drive
+  VcuStatus vcu_status = 6; // VCU 状态
+  repeated MotorState motors = 7; // 四个电机状态列表，按 position 区分
+
+  // repeated sint32 imu_acc = 8; // IMU 加速度数据
+  // repeated sint32 imu_gyro = 9; // IMU 陀螺仪数据
+  // sint32 apps_permille = 10; // 油门踏板千分比
+  // sint32 brake_permille = 11; // 刹车踏板千分比
+  // sint32 steering_cdeg = 12; // 转向角，单位 0.01 度
+}
