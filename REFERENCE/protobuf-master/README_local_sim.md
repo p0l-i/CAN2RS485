@@ -7,7 +7,7 @@
 确保你已经安装了 Python 以及必要的依赖库。
 
 ```bash
-pip install paho-mqtt protobuf pyserial
+pip install paho-mqtt protobuf pyserial python-can
 ```
 
 如果你使用的是较新的 Python 版本（例如 Python 3.14），不要固定安装旧版 `protobuf==4.25.3`，否则可能在导入 `fsae_telemetry_pb2.py` 时触发兼容性错误。此时保持 `protobuf` 为当前最新版即可。
@@ -27,6 +27,8 @@ pip install paho-mqtt protobuf pyserial
     *   `--mode mqtt`: 直接发到服务器 MQTT
     *   `--mode serial`: 通过 USB 转 485 向 DTU 串口送 Protobuf 原始字节流
     *   `--mode both`: 同时发 MQTT 和串口，适合联调
+    *   `--mode pcan`: 通过 PCAN-USB 直接模拟旧主控 `CAN1` 发包，发送旧协议电压帧、温度帧、摘要帧和 `0x03C0` 霍尔电流帧
+    *   `--mode mqtt+pcan` / `serial+pcan` / `all`: 用于边喂板子边做链路对照
 
 ## 3. 配置修改
 
@@ -62,6 +64,26 @@ python local_sim2.py --mode serial --serial-port COM3 --baudrate 115200
 python local_sim2.py --mode both --serial-port COM3 --baudrate 115200
 ```
 
+如果要直接通过 PCAN 模拟旧主控 CAN1：
+
+```bash
+python local_sim2.py --mode pcan --pcan-channel PCAN_USBBUS1 --pcan-bitrate 250000
+```
+
+如果要一边经 PCAN 喂 STM32 板子，一边保留串口或 MQTT 对照：
+
+```bash
+python local_sim2.py --mode serial+pcan --serial-port COM3 --pcan-channel PCAN_USBBUS1
+python local_sim2.py --mode mqtt+pcan --pcan-channel PCAN_USBBUS1
+python local_sim2.py --mode all --serial-port COM3 --pcan-channel PCAN_USBBUS1
+```
+
+说明：
+
+*   `pcan` 后端依赖 `python-can` 和 PEAK 驱动。
+*   默认按旧主控 `CAN1` 速率 `250000` bps 发包。
+*   发送内容按当前固件接收逻辑组织：6 组模组电压扩展帧、6 组温度扩展帧、500 ms 一次的摘要/极值/状态/报警帧，以及每个循环一次的标准帧 `0x03C0` 霍尔电流。
+
 如果 DTU 需要用特定包尾来切包，可以追加：
 
 ```bash
@@ -76,3 +98,5 @@ python local_sim2.py --mode serial --serial-port COM3 --packet-suffix-hex 0D0A
 *   **连接失败**：检查 `SERVER_IP` 是否正确，以及服务器的 1883 端口是否开放（防火墙/安全组）。
 *   **串口打不开**：确认 USB 转 485 的串口号是否正确（设备管理器里查看），并关闭其他占用该串口的软件。
 *   **DTU 收不到完整包**：优先检查 DTU 串口参数是否和脚本一致；如果 DTU 依赖包尾切包，再用 `--packet-suffix-hex` 增加结束符。
+*   **PCAN 打不开**：先确认已安装 PEAK 驱动，且 `python-can` 能识别 `pcan` 接口；通道名通常是 `PCAN_USBBUS1`。
+*   **板子收不到 CAN**：优先检查 PCAN 波特率是否为 `250000`，以及接线是否接在板子的 `CAN1` 总线上。

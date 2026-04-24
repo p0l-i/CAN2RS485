@@ -47,7 +47,7 @@ STM32(CAN) --RS485--> DTU --MQTT/4G--> 阿里云
 
 **测试服务器链路（纯 MQTT）：**
 ```bash
-pip install paho-mqtt protobuf pyserial
+pip install paho-mqtt protobuf pyserial python-can
 python local_sim2.py
 ```
 
@@ -59,6 +59,11 @@ python local_sim2.py --mode serial --serial-port COM3 --baudrate 115200
 **同时验证两条链路：**
 ```bash
 python local_sim2.py --mode both --serial-port COM3 --baudrate 115200
+```
+
+**通过 PCAN 直接模拟旧主控 CAN1：**
+```bash
+python local_sim2.py --mode pcan --pcan-channel PCAN_USBBUS1 --pcan-bitrate 250000
 ```
 
 服务器地址：`123.57.174.98:1883`，Topic：`fsae/telemetry`，Grafana：`https://bitfsae.xin/monitor/`

@@ -7,6 +7,11 @@ import paho.mqtt.client as mqtt
 import fsae_telemetry_pb2 as pb  # 导入刚才生成的库
 
 try:
+    import can
+except ImportError:
+    can = None
+
+try:
     import serial
 except ImportError:
     serial = None
@@ -23,6 +28,8 @@ SERIAL_STOPBITS = 1
 SERIAL_PARITY = "N"
 SERIAL_TIMEOUT = 1.0
 SERIAL_SUFFIX_HEX = ""
+PCAN_CHANNEL = "PCAN_USBBUS1"
+PCAN_BITRATE = 250000
 
 # 发送频率设置
 BASE_FREQ = 10.0           # 基础频率 10Hz
@@ -32,10 +39,66 @@ BMS_DIVIDER = 5            # 10Hz / 5 = 2Hz
 # ===========================================
 
 START_TIMESTAMP = time.time()
+LEGACY_CAN_SUMMARY_DIVIDER = 5
+LEGACY_CAN_VOLTAGE_BASE_ID = 0x180050F3
+LEGACY_CAN_TEMP_BASE_ID = 0x184050F3
+LEGACY_CAN_PACK_SUMMARY_ID = 0x186050F4
+LEGACY_CAN_CELL_EXTREMA_ID = 0x186150F4
+LEGACY_CAN_TEMP_EXTREMA_ID = 0x186250F4
+LEGACY_CAN_STATUS_ID = 0x186350F4
+LEGACY_CAN_ALARM_ID = 0x187650F4
+LEGACY_CAN_HALL_ID = 0x03C0
 
 
 def enum_value(name, default_value):
     return getattr(pb, name, default_value)
+
+
+def clamp_u8(value):
+    return max(0, min(0xFF, int(value)))
+
+
+def clamp_u16(value):
+    return max(0, min(0xFFFF, int(value)))
+
+
+def encode_be16(value):
+    value = clamp_u16(value)
+    return [(value >> 8) & 0xFF, value & 0xFF]
+
+
+def encode_le16(value):
+    value = clamp_u16(value)
+    return [value & 0xFF, (value >> 8) & 0xFF]
+
+
+def encode_legacy_temp_byte(temp_deci_c):
+    temp_c = int(round(temp_deci_c / 10.0))
+    return clamp_u8(temp_c + 30)
+
+
+def encode_hall_current_raw(current_ma):
+    value = (int(current_ma) + 0x80000000) & 0xFFFFFFFF
+    return [
+        (value >> 24) & 0xFF,
+        (value >> 16) & 0xFF,
+        (value >> 8) & 0xFF,
+        value & 0xFF,
+    ]
+
+
+def mode_targets(mode):
+    mapping = {
+        "mqtt": {"mqtt"},
+        "serial": {"serial"},
+        "both": {"mqtt", "serial"},
+        "pcan": {"pcan"},
+        "mqtt+pcan": {"mqtt", "pcan"},
+        "serial+pcan": {"serial", "pcan"},
+        "all": {"mqtt", "serial", "pcan"},
+    }
+    return mapping[mode]
+
 
 def get_current_time_ms():
     # 2. 修改这里：计算当前时间与启动时间的差值 (模拟单片机的 HAL_GetTick)
@@ -239,6 +302,110 @@ class CarSimulator:
 
         return frame
 
+    def build_legacy_can_messages(self):
+        if not self.module_snapshots:
+            self._refresh_bms_cache()
+
+        messages = []
+        all_voltages = []
+        all_temps = []
+
+        for module_data in self.module_snapshots:
+            all_voltages.extend(module_data["voltages"])
+            all_temps.extend(module_data["temps"])
+
+        for module_index, module_data in enumerate(self.module_snapshots):
+            voltages = module_data["voltages"]
+            for frame_index in range(6):
+                ext_id = LEGACY_CAN_VOLTAGE_BASE_ID + ((module_index * 6 + frame_index) << 16)
+                if frame_index == 0:
+                    payload = [0x00, 0x00]
+                    payload.extend(encode_le16(voltages[0]))
+                    payload.extend(encode_le16(voltages[1]))
+                    payload.extend(encode_le16(voltages[2]))
+                else:
+                    start = 3 + ((frame_index - 1) * 4)
+                    payload = []
+                    for cell_index in range(start, start + 4):
+                        payload.extend(encode_le16(voltages[cell_index]))
+                messages.append((ext_id, payload, True))
+
+            temp_payload = [encode_legacy_temp_byte(temp) for temp in module_data["temps"]]
+            if module_index in (2, 3):
+                temp_payload = [0x00] + temp_payload[:7]
+            ext_id = LEGACY_CAN_TEMP_BASE_ID + (module_index << 16)
+            messages.append((ext_id, temp_payload, True))
+
+        if self.frame_count % LEGACY_CAN_SUMMARY_DIVIDER == 0:
+            max_voltage = max(all_voltages)
+            min_voltage = min(all_voltages)
+            max_voltage_index = all_voltages.index(max_voltage)
+            min_voltage_index = all_voltages.index(min_voltage)
+            max_temp = max(all_temps)
+            min_temp = min(all_temps)
+            max_temp_index = all_temps.index(max_temp)
+            min_temp_index = all_temps.index(min_temp)
+            soc_pct = max(0, min(100, int((self.hv_voltage - 320.0) / 0.7)))
+
+            battery_state = 5 if self.rpm > 0 else 3
+            battery_alarm_level = 0
+            alarm_payload = [0x00] * 6
+            if min_voltage < 3900:
+                battery_alarm_level = max(battery_alarm_level, 1)
+                alarm_payload[0] |= 0x10
+            if max_temp > 500:
+                battery_alarm_level = max(battery_alarm_level, 2)
+                alarm_payload[0] |= 0x08
+
+            current_raw = clamp_u16(int(round(self.hv_current * 10.0)) + 10000)
+            pack_voltage_dv = clamp_u16(int(round(self.hv_voltage * 10.0)))
+
+            summary_payload = []
+            summary_payload.extend(encode_be16(pack_voltage_dv))
+            summary_payload.extend(encode_be16(current_raw))
+            summary_payload.extend([
+                clamp_u8(soc_pct),
+                0x00,
+                ((battery_state & 0x0F) << 4) | (battery_alarm_level & 0x0F),
+            ])
+            messages.append((LEGACY_CAN_PACK_SUMMARY_ID, summary_payload, True))
+
+            cell_extrema_payload = []
+            cell_extrema_payload.extend(encode_be16(max_voltage))
+            cell_extrema_payload.extend(encode_be16(min_voltage))
+            cell_extrema_payload.extend([
+                clamp_u8(max_voltage_index),
+                clamp_u8(min_voltage_index),
+            ])
+            messages.append((LEGACY_CAN_CELL_EXTREMA_ID, cell_extrema_payload, True))
+
+            temp_extrema_payload = [
+                encode_legacy_temp_byte(max_temp),
+                encode_legacy_temp_byte(min_temp),
+                clamp_u8(max_temp_index),
+                clamp_u8(min_temp_index),
+                0x00,
+            ]
+            messages.append((LEGACY_CAN_TEMP_EXTREMA_ID, temp_extrema_payload, True))
+
+            relay_state = 1 if self.rpm > 0 else 0
+            status_payload = [
+                ((relay_state & 0x03) << 6) | ((relay_state & 0x03) << 4) | ((relay_state & 0x03) << 2),
+                0x00,
+            ]
+            status_payload.extend(encode_be16(pack_voltage_dv))
+            status_payload.extend(encode_be16(0))
+            status_payload.extend(encode_be16(pack_voltage_dv))
+            messages.append((LEGACY_CAN_STATUS_ID, status_payload, True))
+
+            messages.append((LEGACY_CAN_ALARM_ID, alarm_payload, True))
+
+        hall_payload = encode_hall_current_raw(int(round(self.hv_current * 1000.0)))
+        hall_payload.extend([0x00, 0x12, 0x34, 0x01])
+        messages.append((LEGACY_CAN_HALL_ID, hall_payload, False))
+
+        return messages
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -246,9 +413,12 @@ def parse_args():
     )
     parser.add_argument(
         "--mode",
-        choices=["mqtt", "serial", "both"],
+        choices=["mqtt", "serial", "both", "pcan", "mqtt+pcan", "serial+pcan", "all"],
         default="mqtt",
-        help="mqtt: direct to broker; serial: write protobuf to USB-RS485; both: send to both paths.",
+        help=(
+            "mqtt: direct to broker; serial: write protobuf to USB-RS485; both: send to both paths; "
+            "pcan: emit legacy CAN1 frames through PCAN."
+        ),
     )
     parser.add_argument("--server-ip", default=SERVER_IP)
     parser.add_argument("--server-port", type=int, default=SERVER_PORT)
@@ -264,6 +434,8 @@ def parse_args():
         default=SERIAL_SUFFIX_HEX,
         help="Optional hex suffix appended to every serial packet, e.g. 0A or 0D0A.",
     )
+    parser.add_argument("--pcan-channel", default=PCAN_CHANNEL, help="PCAN adapter channel, e.g. PCAN_USBBUS1.")
+    parser.add_argument("--pcan-bitrate", type=int, default=PCAN_BITRATE, help="Legacy CAN1 bitrate, default 250000.")
     return parser.parse_args()
 
 
@@ -293,6 +465,19 @@ def open_serial_port(args):
     return ser
 
 
+def open_pcan_bus(args):
+    if can is None:
+        raise RuntimeError("python-can is not installed. Run: pip install python-can")
+    print(f"Opening PCAN bus: {args.pcan_channel} | bitrate={args.pcan_bitrate}")
+    bus = can.Bus(
+        interface="pcan",
+        channel=args.pcan_channel,
+        bitrate=args.pcan_bitrate,
+    )
+    print("PCAN connected.")
+    return bus
+
+
 def build_serial_packet(frame, packet_suffix_hex):
     payload = frame.SerializeToString()
     if packet_suffix_hex:
@@ -316,12 +501,16 @@ def main():
     args = parse_args()
     client = None
     ser = None
+    bus = None
+    targets = mode_targets(args.mode)
 
     try:
-        if args.mode in ("mqtt", "both"):
+        if "mqtt" in targets:
             client = open_mqtt_client(args)
-        if args.mode in ("serial", "both"):
+        if "serial" in targets:
             ser = open_serial_port(args)
+        if "pcan" in targets:
+            bus = open_pcan_bus(args)
     except Exception as e:
         print(f"Initialization failed: {e}")
         return
@@ -345,15 +534,34 @@ def main():
                 ser.write(serial_payload)
                 ser.flush()
 
+            can_count = 0
+            if bus is not None:
+                legacy_messages = sim.build_legacy_can_messages()
+                can_count = len(legacy_messages)
+                for arbitration_id, data, is_extended_id in legacy_messages:
+                    bus.send(
+                        can.Message(
+                            arbitration_id=arbitration_id,
+                            is_extended_id=is_extended_id,
+                            data=data,
+                        )
+                    )
+
             if len(frame.modules) > 0:
                 extra = ""
                 if ser is not None:
                     extra = f" | serial_bytes: {len(serial_payload)}"
+                if bus is not None:
+                    extra += f" | can_frames: {can_count}"
                 print(f"Sent merged telemetry+BMS frame @ {get_frame_timestamp(frame)}{extra}")
 
             # 打印日志 (每 10 帧打印一次，避免刷屏)
             if sim.frame_count % 10 == 0:
-                print(f"ID: {get_frame_seq(frame):05d} | State: {sim.state:5s} | RPM: {get_frame_rpm(frame):5d} | SOC: {frame.battery_soc:3d}%")
+                pcan_text = f" | CAN: {can_count:02d}" if bus is not None else ""
+                print(
+                    f"ID: {get_frame_seq(frame):05d} | State: {sim.state:5s} | RPM: {get_frame_rpm(frame):5d} "
+                    f"| SOC: {frame.battery_soc:3d}%{pcan_text}"
+                )
 
             # 精确控制频率
             elapsed = time.time() - start_time
@@ -366,6 +574,8 @@ def main():
             client.disconnect()
         if ser is not None and ser.is_open:
             ser.close()
+        if bus is not None:
+            bus.shutdown()
 
 if __name__ == "__main__":
     main()

@@ -150,6 +150,7 @@ static uint16_t App_ReadLe16(const uint8_t *data);
 static int32_t App_ReadBe32Signed(const uint8_t *data);
 static uint8_t App_IsFresh(uint32_t now, uint32_t updated_ms);
 static void App_SetProtocol(AppProtocol protocol);
+static uint32_t App_ComputeFaultCode(const AppTelemetryState *state, uint32_t now);
 static void App_UpdateFaultCode(void);
 static HAL_StatusTypeDef App_CAN_ConfigFilter(CAN_HandleTypeDef *hcan, uint32_t filter_bank);
 static void App_ProcessCanRx(CAN_HandleTypeDef *hcan, const CAN_RxHeaderTypeDef *header, const uint8_t *data);
@@ -307,19 +308,7 @@ static void App_SetProtocol(AppProtocol protocol)
 
 static void App_UpdateFaultCode(void)
 {
-  g_app_state.battery_fault_code = g_app_state.alarm_fault_code;
-  if (g_app_state.hall_fault_active != 0U)
-  {
-    g_app_state.battery_fault_code |= APP_HALL_FAULT_BIT;
-  }
-  if (g_app_state.imd_fault_active != 0U)
-  {
-    g_app_state.battery_fault_code |= APP_IMD_FAULT_BIT;
-  }
-  if (App_IsFresh(HAL_GetTick(), g_app_state.can2_diag_updated_ms) != 0U)
-  {
-    g_app_state.battery_fault_code |= (uint32_t)g_app_state.can2_error_rom_low16;
-  }
+  g_app_state.battery_fault_code = App_ComputeFaultCode((const AppTelemetryState *)&g_app_state, HAL_GetTick());
 }
 
 static HAL_StatusTypeDef App_CAN_ConfigFilter(CAN_HandleTypeDef *hcan, uint32_t filter_bank)
@@ -368,7 +357,6 @@ static void App_ProcessCan1Rx(const CAN_RxHeaderTypeDef *header, const uint8_t *
     g_app_state.hall_sensor_name = App_ReadBe16(&data[5]);
     g_app_state.hall_sw_version = data[7];
     g_app_state.hall_updated_ms = HAL_GetTick();
-    g_app_state.hall_fault_active = g_app_state.hall_error;
     g_app_state.can1_seen = 1U;
     App_UpdateFaultCode();
   }
@@ -733,6 +721,36 @@ static uint32_t App_BuildBatteryFaultCode(const uint8_t *data)
   return faults;
 }
 
+static uint32_t App_ComputeFaultCode(const AppTelemetryState *state, uint32_t now)
+{
+  uint32_t faults = 0U;
+
+  if (App_IsFresh(now, state->alarm_updated_ms) != 0U)
+  {
+    faults |= state->alarm_fault_code;
+  }
+
+  if (App_IsFresh(now, state->hall_updated_ms) != 0U && (state->hall_error != 0U))
+  {
+    faults |= APP_HALL_FAULT_BIT;
+  }
+
+  if (App_IsFresh(now, state->can2_diag_updated_ms) != 0U)
+  {
+    if (state->hall_fault_active != 0U)
+    {
+      faults |= APP_HALL_FAULT_BIT;
+    }
+    if (state->imd_fault_active != 0U)
+    {
+      faults |= APP_IMD_FAULT_BIT;
+    }
+    faults |= (uint32_t)state->can2_error_rom_low16;
+  }
+
+  return faults;
+}
+
 static float App_GetHvVoltage(const AppTelemetryState *state, uint32_t now)
 {
   uint32_t i;
@@ -812,7 +830,7 @@ static uint32_t App_GetBatterySoc(const AppTelemetryState *state, uint32_t now)
     return state->can2_soc;
   }
 
-  return state->battery_soc;
+  return 0U;
 }
 
 static uint32_t App_GetVcuStatus(const AppTelemetryState *state, uint32_t now)
@@ -842,8 +860,7 @@ static uint32_t App_GetReadyToDrive(const AppTelemetryState *state, uint32_t now
 
 static uint32_t App_GetFaultCode(const AppTelemetryState *state, uint32_t now)
 {
-  (void)now;
-  return state->battery_fault_code;
+  return App_ComputeFaultCode(state, now);
 }
 
 static float App_GetBatteryTempMax(const AppTelemetryState *state, uint32_t now, int32_t max_temp)
