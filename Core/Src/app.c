@@ -1,5 +1,6 @@
 #include "app.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "can.h"
@@ -39,11 +40,20 @@
 #define APP_CAN2_POWER_STATUS_ID        0x0401U
 #define APP_CAN2_DIAG_STATUS_ID         0x0402U
 
-#define APP_HEARTBEAT_PERIOD_MS         500U
+#define APP_LED_FAST_BLINK_MS           100U
+#define APP_LED_SLOW_BLINK_MS           500U
+#define APP_LED_LINK_HOLD_MS            500U
 #define APP_BASE_TELEMETRY_PERIOD_MS    100U
 #define APP_MODULE_TELEMETRY_PERIOD_MS  500U
 #define APP_SNAPSHOT_TIMEOUT_MS         2000U
 #define APP_RS485_TX_TIMEOUT_MS         200U
+#define APP_DEBUG_UART_TIMEOUT_MS       50U
+#define APP_DEBUG_CAN_TRACE_DEPTH       8U
+#define APP_DEBUG_DUMP_COUNT            3U
+#define APP_DEBUG_CLI_BUFFER_SIZE       32U
+
+#define APP_LED_ON_STATE                GPIO_PIN_RESET
+#define APP_LED_OFF_STATE               GPIO_PIN_SET
 
 #define APP_HALL_FAULT_BIT              (1UL << 18)
 #define APP_IMD_FAULT_BIT               (1UL << 19)
@@ -136,14 +146,33 @@ typedef struct
   uint8_t can2_seen;
 } AppTelemetryState;
 
+typedef struct
+{
+  uint8_t bus_index;
+  uint8_t is_extended_id;
+  uint8_t dlc;
+  uint32_t id;
+  uint8_t data[8];
+} AppCanTraceFrame;
+
 static volatile AppTelemetryState g_app_state;
 static AppTelemetryState g_tx_snapshot;
 static fsae_TelemetryFrame g_tx_frame;
 static uint8_t g_pb_buffer[fsae_TelemetryFrame_size];
 static uint32_t g_frame_counter;
-static uint32_t g_last_heartbeat_ms;
 static uint32_t g_last_base_tx_ms;
 static uint32_t g_last_module_tx_ms;
+static uint32_t g_last_led_toggle_ms;
+static uint32_t g_last_rs485_tx_ms;
+static uint8_t g_led_blink_on;
+static volatile AppCanTraceFrame g_can_trace[APP_DEBUG_CAN_TRACE_DEPTH];
+static volatile uint8_t g_can_trace_write_index;
+static volatile uint8_t g_can_trace_count;
+static volatile uint8_t g_cli_rx_byte;
+static volatile char g_cli_rx_buffer[APP_DEBUG_CLI_BUFFER_SIZE];
+static volatile uint8_t g_cli_rx_length;
+static volatile char g_cli_command_buffer[APP_DEBUG_CLI_BUFFER_SIZE];
+static volatile uint8_t g_cli_command_ready;
 
 static uint16_t App_ReadBe16(const uint8_t *data);
 static uint16_t App_ReadLe16(const uint8_t *data);
@@ -152,6 +181,11 @@ static uint8_t App_IsFresh(uint32_t now, uint32_t updated_ms);
 static void App_SetProtocol(AppProtocol protocol);
 static uint32_t App_ComputeFaultCode(const AppTelemetryState *state, uint32_t now);
 static void App_UpdateFaultCode(void);
+static void App_SetStatusLed(uint8_t on);
+static void App_UpdateStatusLed(uint32_t now);
+static void App_DebugRecordCanRx(CAN_HandleTypeDef *hcan, const CAN_RxHeaderTypeDef *header, const uint8_t *data);
+static void App_DebugPollCli(void);
+static void App_DebugDumpRecentCan(const char *command);
 static HAL_StatusTypeDef App_CAN_ConfigFilter(CAN_HandleTypeDef *hcan, uint32_t filter_bank);
 static void App_ProcessCanRx(CAN_HandleTypeDef *hcan, const CAN_RxHeaderTypeDef *header, const uint8_t *data);
 static void App_ProcessCan1Rx(const CAN_RxHeaderTypeDef *header, const uint8_t *data);
@@ -191,9 +225,17 @@ void App_Init(void)
 {
   memset((void *)&g_app_state, 0, sizeof(g_app_state));
   g_frame_counter = 0U;
-  g_last_heartbeat_ms = HAL_GetTick();
   g_last_base_tx_ms = HAL_GetTick();
   g_last_module_tx_ms = HAL_GetTick();
+  g_last_led_toggle_ms = HAL_GetTick();
+  g_last_rs485_tx_ms = 0U;
+  g_led_blink_on = 0U;
+  g_can_trace_write_index = 0U;
+  g_can_trace_count = 0U;
+  g_cli_rx_length = 0U;
+  g_cli_command_ready = 0U;
+
+  App_SetStatusLed(0U);
 
   if (App_CAN_ConfigFilter(&hcan1, APP_CAN1_FILTER_BANK) != HAL_OK)
   {
@@ -224,6 +266,11 @@ void App_Init(void)
   {
     Error_Handler();
   }
+
+  if (HAL_UART_Receive_IT(&huart1, (uint8_t *)&g_cli_rx_byte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 void App_Run(void)
@@ -231,11 +278,8 @@ void App_Run(void)
   uint32_t now = HAL_GetTick();
   uint8_t include_modules;
 
-  if ((uint32_t)(now - g_last_heartbeat_ms) >= APP_HEARTBEAT_PERIOD_MS)
-  {
-    HAL_GPIO_TogglePin(LED_HEARTBEAT_GPIO_Port, LED_HEARTBEAT_Pin);
-    g_last_heartbeat_ms = now;
-  }
+  App_UpdateStatusLed(now);
+  App_DebugPollCli();
 
   if ((g_app_state.can1_seen == 0U) && (g_app_state.can2_seen == 0U))
   {
@@ -311,6 +355,139 @@ static void App_UpdateFaultCode(void)
   g_app_state.battery_fault_code = App_ComputeFaultCode((const AppTelemetryState *)&g_app_state, HAL_GetTick());
 }
 
+static void App_SetStatusLed(uint8_t on)
+{
+  HAL_GPIO_WritePin(LED_HEARTBEAT_GPIO_Port, LED_HEARTBEAT_Pin, (on != 0U) ? APP_LED_ON_STATE : APP_LED_OFF_STATE);
+}
+
+static void App_UpdateStatusLed(uint32_t now)
+{
+  uint8_t has_fault = (App_ComputeFaultCode((const AppTelemetryState *)&g_app_state, now) != 0U) ? 1U : 0U;
+  uint8_t link_active = ((g_last_rs485_tx_ms != 0U) &&
+                         ((g_app_state.can1_seen != 0U) || (g_app_state.can2_seen != 0U)) &&
+                         ((uint32_t)(now - g_last_rs485_tx_ms) <= APP_LED_LINK_HOLD_MS)) ? 1U : 0U;
+  uint32_t blink_period = (has_fault != 0U) ? APP_LED_FAST_BLINK_MS : APP_LED_SLOW_BLINK_MS;
+
+  if (link_active != 0U)
+  {
+    g_led_blink_on = 1U;
+    App_SetStatusLed(1U);
+    return;
+  }
+
+  if ((uint32_t)(now - g_last_led_toggle_ms) >= blink_period)
+  {
+    g_last_led_toggle_ms = now;
+    g_led_blink_on = (uint8_t)(g_led_blink_on == 0U);
+    App_SetStatusLed(g_led_blink_on);
+  }
+}
+
+static void App_DebugRecordCanRx(CAN_HandleTypeDef *hcan, const CAN_RxHeaderTypeDef *header, const uint8_t *data)
+{
+  AppCanTraceFrame *slot = (AppCanTraceFrame *)&g_can_trace[g_can_trace_write_index];
+
+  slot->bus_index = (hcan->Instance == CAN1) ? 1U : 2U;
+  slot->is_extended_id = (header->IDE == CAN_ID_EXT) ? 1U : 0U;
+  slot->dlc = header->DLC;
+  slot->id = (header->IDE == CAN_ID_EXT) ? header->ExtId : header->StdId;
+  memcpy(slot->data, data, 8U);
+
+  g_can_trace_write_index = (uint8_t)((g_can_trace_write_index + 1U) % APP_DEBUG_CAN_TRACE_DEPTH);
+  if (g_can_trace_count < APP_DEBUG_CAN_TRACE_DEPTH)
+  {
+    g_can_trace_count++;
+  }
+}
+
+static void App_DebugPollCli(void)
+{
+  uint8_t ready;
+  char command[APP_DEBUG_CLI_BUFFER_SIZE];
+
+  __disable_irq();
+  ready = g_cli_command_ready;
+  if (ready != 0U)
+  {
+    memcpy(command, (const void *)g_cli_command_buffer, APP_DEBUG_CLI_BUFFER_SIZE);
+    g_cli_command_ready = 0U;
+  }
+  __enable_irq();
+
+  if (ready == 0U)
+  {
+    return;
+  }
+
+  App_DebugDumpRecentCan(command);
+}
+
+static void App_DebugDumpRecentCan(const char *command)
+{
+  AppCanTraceFrame frames[APP_DEBUG_DUMP_COUNT];
+  uint8_t count;
+  uint8_t write_index;
+  uint8_t i;
+  char line[96];
+
+  __disable_irq();
+  count = g_can_trace_count;
+  write_index = g_can_trace_write_index;
+  if (count > APP_DEBUG_DUMP_COUNT)
+  {
+    count = APP_DEBUG_DUMP_COUNT;
+  }
+  for (i = 0U; i < count; ++i)
+  {
+    uint8_t src_index = (uint8_t)((write_index + APP_DEBUG_CAN_TRACE_DEPTH - count + i) % APP_DEBUG_CAN_TRACE_DEPTH);
+    frames[i] = *((const AppCanTraceFrame *)&g_can_trace[src_index]);
+  }
+  __enable_irq();
+
+  if (count == 0U)
+  {
+    int written = snprintf(line, sizeof(line), "cli[%s]: no CAN frames captured yet\r\n", command);
+    if (written > 0)
+    {
+      (void)HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)written, APP_DEBUG_UART_TIMEOUT_MS);
+    }
+    return;
+  }
+
+  {
+    int written = snprintf(line, sizeof(line), "cli[%s]: dumping %u recent CAN frames\r\n", command, count);
+    if (written > 0)
+    {
+      (void)HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)written, APP_DEBUG_UART_TIMEOUT_MS);
+    }
+  }
+
+  for (i = 0U; i < count; ++i)
+  {
+    int written = snprintf(
+      line,
+      sizeof(line),
+      "CAN%u %s 0x%08lX DLC=%u [%02X %02X %02X %02X %02X %02X %02X %02X]\r\n",
+      frames[i].bus_index,
+      (frames[i].is_extended_id != 0U) ? "EXT" : "STD",
+      (unsigned long)frames[i].id,
+      frames[i].dlc,
+      frames[i].data[0],
+      frames[i].data[1],
+      frames[i].data[2],
+      frames[i].data[3],
+      frames[i].data[4],
+      frames[i].data[5],
+      frames[i].data[6],
+      frames[i].data[7]
+    );
+    if (written > 0)
+    {
+      (void)HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)written, APP_DEBUG_UART_TIMEOUT_MS);
+    }
+  }
+}
+
 static HAL_StatusTypeDef App_CAN_ConfigFilter(CAN_HandleTypeDef *hcan, uint32_t filter_bank)
 {
   CAN_FilterTypeDef filter = {0};
@@ -331,6 +508,8 @@ static HAL_StatusTypeDef App_CAN_ConfigFilter(CAN_HandleTypeDef *hcan, uint32_t 
 
 static void App_ProcessCanRx(CAN_HandleTypeDef *hcan, const CAN_RxHeaderTypeDef *header, const uint8_t *data)
 {
+  App_DebugRecordCanRx(hcan, header, data);
+
   if (hcan->Instance == CAN1)
   {
     App_ProcessCan1Rx(header, data);
@@ -1131,5 +1310,36 @@ static HAL_StatusTypeDef App_RS485_Transmit(const uint8_t *data, uint16_t size)
   }
 
   HAL_GPIO_WritePin(RS485_DIR_GPIO_Port, RS485_DIR_Pin, GPIO_PIN_RESET);
+  g_last_rs485_tx_ms = HAL_GetTick();
   return HAL_OK;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    uint8_t rx = g_cli_rx_byte;
+
+    if ((rx == '\r') || (rx == '\n'))
+    {
+      if ((g_cli_rx_length > 0U) && (g_cli_command_ready == 0U))
+      {
+        memcpy((void *)g_cli_command_buffer, (const void *)g_cli_rx_buffer, g_cli_rx_length);
+        g_cli_command_buffer[g_cli_rx_length] = '\0';
+        g_cli_command_ready = 1U;
+      }
+      g_cli_rx_length = 0U;
+    }
+    else if (g_cli_rx_length < (APP_DEBUG_CLI_BUFFER_SIZE - 1U))
+    {
+      g_cli_rx_buffer[g_cli_rx_length] = (char)rx;
+      g_cli_rx_length++;
+    }
+    else
+    {
+      g_cli_rx_length = 0U;
+    }
+
+    (void)HAL_UART_Receive_IT(&huart1, (uint8_t *)&g_cli_rx_byte, 1U);
+  }
 }
